@@ -26,13 +26,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
                     mixup_fn: Optional[Mixup] = None, log_writer=None,
-                    args=None, mask_q=None, mask_k=None, mask_attn=None):
-    # >>>>>>>>>>>>>>>>> Subhajit's Implementation
-    # args=None,mask_q=None,mask_k=None,mask_attn=None,mask_act=None,mask_ratio=0.0):
-    # >>>>>>>>>>>>>>>>> Subhajit's Implementation
+                    args=None):
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('acc1', misc.SmoothedValue(window_size=1, fmt='{value:.3f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 20
 
@@ -44,8 +42,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         print('log_dir: {}'.format(log_writer.log_dir))
 
     for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-
-        # we use a per iteration (instead of per epoch) lr scheduler
+        
+        if data_iter_step < 5:
+            print(f"Batch {data_iter_step} - Samples shape: {samples.shape}, Targets: {targets[:10]}")  # Print first 10 targets
+    
+        # We use a per iteration (instead of per epoch) lr scheduler
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
@@ -57,7 +58,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         estep = (epoch, data_iter_step)
         with torch.cuda.amp.autocast():
-            outputs = model(samples, mask_q, mask_k, mask_attn, estep)
+            outputs = model(samples, estep)
             loss = criterion(outputs, targets)
 
         loss_value = loss.item()
@@ -76,7 +77,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         torch.cuda.synchronize()
 
+        # Compute accuracy
+        acc1, acc5 = accuracy(outputs, targets, topk=(1, 5))
+
         metric_logger.update(loss=loss_value)
+        metric_logger.update(acc1=acc1.item())  # Update accuracy in metric logger
         min_lr = 10.
         max_lr = 0.
         for group in optimizer.param_groups:
@@ -93,15 +98,19 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
             log_writer.add_scalar('loss', loss_value_reduce, epoch_1000x)
             log_writer.add_scalar('lr', max_lr, epoch_1000x)
+            log_writer.add_scalar('train_acc1', acc1.item(), epoch_1000x)  # Log accuracy
 
-    # gather the stats from all processes
+    # Gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
+    
+    # Return the loss and accuracy
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
+
 @torch.no_grad()
-def evaluate(data_loader, model, device, mask_q, mask_k, mask_attn):
+def evaluate(data_loader, model, device):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -119,7 +128,7 @@ def evaluate(data_loader, model, device, mask_q, mask_k, mask_attn):
         # compute output
         estep = (None, None)
         with torch.cuda.amp.autocast():
-            output = model(images, mask_q, mask_k, mask_attn, estep)
+            output = model(images, estep)
             loss = criterion(output, target)
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -128,6 +137,7 @@ def evaluate(data_loader, model, device, mask_q, mask_k, mask_attn):
         metric_logger.update(loss=loss.item())
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
         metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+        
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
@@ -137,7 +147,7 @@ def evaluate(data_loader, model, device, mask_q, mask_k, mask_attn):
 
 
 @torch.no_grad()
-def evaluate_results(data_loader, model, device, mask_q, mask_k, mask_attn):
+def evaluate_results(data_loader, model, device):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -158,7 +168,7 @@ def evaluate_results(data_loader, model, device, mask_q, mask_k, mask_attn):
         # compute output
         estep = (None, None)
         with torch.cuda.amp.autocast():
-            output = model(images, mask_q, mask_k, mask_attn, estep)
+            output = model(images, estep)
             loss = criterion(output, target)
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))

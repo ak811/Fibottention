@@ -36,9 +36,11 @@ from utils.misc import NativeScalerWithGradNormCount as NativeScaler
 import models_vit
 
 from engine_finetune import train_one_epoch, evaluate, evaluate_results
-from exp import  get_mask , get_mask_attn
+from utils import plot
 
 import matplotlib.pyplot as plt
+
+from utils import config
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE fine-tuning for image classification', add_help=False)
@@ -164,6 +166,9 @@ def main(args):
     print("{}".format(args).replace(', ', ',\n'))
 
     device = torch.device(args.device)
+
+    config.output_dir = args.output_dir
+    print(f"Output directory set to: {config.output_dir}")
 
     # fix the seed for reproducibility
     seed = args.seed + misc.get_rank()
@@ -301,20 +306,8 @@ def main(args):
 
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
-    num_patches = 196
-    embed_dim = 64
-    heads = 12
-    
-    mask_k = get_mask(args.mask_ratio, args.batch_size, heads, num_patches, embed_dim)
-    mask_q = get_mask(args.mask_ratio, args.batch_size, heads, num_patches, embed_dim) 
-
-    mask_attn  = get_mask_attn(args.mask_ratio,args.batch_size,heads,num_patches)
-
-    mask_attn = torch.cat((torch.ones((args.batch_size,heads, num_patches, 1),  dtype=torch.bool,device="cuda"), mask_attn), dim=3) # [16,16,196,197]
-    mask_attn = torch.cat((torch.ones((args.batch_size, heads, 1,num_patches+1), dtype=torch.bool, device="cuda"), mask_attn), dim=2) # [16,16,197,197]
-
     if args.eval:
-        test_stats, result = evaluate_results(data_loader_val, model, device,mask_q,mask_k,mask_attn)
+        test_stats, result = evaluate_results(data_loader_val, model, device)
         torch.save(result, 'cls_local_without_diagonal_64batch_1gpu_w5.pth')
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         exit(0)
@@ -323,7 +316,11 @@ def main(args):
     start_time = time.time()
     max_accuracy = 0.0
 
-    epoch_accuracies = []
+    train_accuracies = []
+    test_accuracies = []
+    train_losses = []
+    test_losses = []
+    epochs_list = list(range(args.start_epoch, args.epochs))
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -334,26 +331,33 @@ def main(args):
             optimizer, device, epoch, loss_scaler,
             args.clip_grad, mixup_fn,
             log_writer=log_writer,
-            args=args,
-            mask_q = mask_q,
-            mask_k = mask_k,
-            mask_attn = mask_attn
+            args=args
         )
 
-        if epoch == 99:
+        train_accuracies.append(train_stats['acc1'])
+        train_losses.append(train_stats['loss'])
+
+        # Log train accuracy
+        train_acc1 = train_stats['acc1']
+        print(f"Training Accuracy of the network on epoch {epoch}: {train_acc1:.1f}%")
+
+        print(model_without_ddp)
+
+        if epoch == args.epochs - 1:
             if args.output_dir:
                         misc.save_model(
                         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                         loss_scaler=loss_scaler, epoch=epoch)
 
-        print(model.state_dict()['module.blocks.11.attn.proj.weight'].shape)
-        test_stats = evaluate(data_loader_val, model, device, mask_q, mask_k, mask_attn)
+        # print(model.state_dict()['module.blocks.11.attn.proj.weight'].shape)
+        test_stats = evaluate(data_loader_val, model, device)
+
+        test_accuracies.append(test_stats['acc1'])
+        test_losses.append(test_stats['loss'])
 
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         max_accuracy = max(max_accuracy, test_stats["acc1"])
         print(f'Max accuracy: {max_accuracy:.2f}%')
-
-        epoch_accuracies.append(test_stats['acc1'])
         
         if log_writer is not None:
             log_writer.add_scalar('perf/test_acc1', test_stats['acc1'], epoch)
@@ -361,9 +365,10 @@ def main(args):
             log_writer.add_scalar('perf/test_loss', test_stats['loss'], epoch)
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                        **{f'test_{k}': v for k, v in test_stats.items()},
-                        'epoch': epoch,
-                        'n_parameters': n_parameters}
+             **{f'test_{k}': v for k, v in test_stats.items()},
+             'epoch': epoch,
+             'n_parameters': n_parameters,
+             'train_acc1': train_acc1}
 
         if args.output_dir and misc.is_main_process():
             if log_writer is not None:
@@ -371,6 +376,9 @@ def main(args):
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
+    plot.plot_metrics(train_accuracies, test_accuracies, train_losses, test_losses, epochs_list,
+                      save_path=os.path.join(args.output_dir, 'training_metrics.png'))
+    
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))

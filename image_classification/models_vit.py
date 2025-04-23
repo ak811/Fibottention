@@ -32,7 +32,7 @@ class VisionTransformer(vision_transformer.VisionTransformer):
 
             del self.norm  # remove the original norm
 
-    def forward_features(self, x, mask_q, mask_k, mask_attn, estep):
+    def forward_features(self, x, estep):
         B = x.shape[0]
         x = self.patch_embed(x)
 
@@ -42,7 +42,7 @@ class VisionTransformer(vision_transformer.VisionTransformer):
         x = self.pos_drop(x)
 
         for blk in self.blocks:
-            x = blk(x, mask_q, mask_k, mask_attn, estep)
+            x = blk(x, estep)
 
         if self.global_pool:
             x = x[:, 1:, :].mean(dim=1)  # global pool without cls token
@@ -52,7 +52,24 @@ class VisionTransformer(vision_transformer.VisionTransformer):
             outcome = x[:, 0]
 
         return outcome
+    
+    def get_last_selfattention(self, x, estep):
+        
+        print(x.shape)
 
+        B = x.shape[0]
+        x = self.patch_embed(x)
+
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+
+        for i, blk in enumerate(self.blocks):
+            if i < (len(self.blocks)-1): x = blk(x, estep)
+            else: outcome = blk(x, estep, attn_flag=True)
+
+        return outcome
 
 def vit_tiny_patch16(**kwargs):
     model = VisionTransformer(
@@ -60,20 +77,35 @@ def vit_tiny_patch16(**kwargs):
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
-
 def vit_base_patch16(**kwargs):
     model = VisionTransformer(
         patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
+def vit_base_patch8(**kwargs):
+    model = VisionTransformer(
+        patch_size=8, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
+def vit_base_patch4(**kwargs):
+    model = VisionTransformer(
+        patch_size=4, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
+def vit_base_patch2(**kwargs):
+    model = VisionTransformer(
+        patch_size=2, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
 
 def vit_large_patch16(**kwargs):
     model = VisionTransformer(
         patch_size=16, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
-
 
 def vit_huge_patch14(**kwargs):
     model = VisionTransformer(

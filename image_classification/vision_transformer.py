@@ -38,6 +38,8 @@ import matplotlib.pyplot as plt
 import datetime
 import sys
 import os
+import torchvision
+from utils import config
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD, \
     OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
@@ -46,12 +48,13 @@ from timm.layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_normal_,
 from timm.models._builder import build_model_with_cfg
 from timm.models._manipulate import named_apply, checkpoint_seq, adapt_input_conv
 from timm.models._registry import generate_default_cfgs, register_model, register_model_deprecations
-from utils.plot import plot_attention_mask_for_all_heads, plot_attention_mask_for_all_batches, plot_attention_heatmap_for_all_heads, plot_attention_heatmap_for_all_batches
+from utils.plot import plot_attention_mask_for_all_heads, plot_attention_mask_for_all_batches, plot_attention_heatmap_for_all_heads, plot_total_aggregated_attention_heatmap
 
 __all__ = ['VisionTransformer']  # model_registry will add each entrypoint fn to this
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fibottention import get_mask_attn_wythoff
+from intermediate_storage import save_intermediate_x
 
 _logger = logging.getLogger(__name__)
 
@@ -82,7 +85,8 @@ class Attention(nn.Module):
         self.depth_id = depth_id
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
-        self.fused_attn = use_fused_attn()
+        # self.fused_attn = use_fused_attn()
+        self.fused_attn = False
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
@@ -92,7 +96,7 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.mask_flags = True
 
-    def forward(self, x, mask_q, mask_k, mask_attn, estep):
+    def forward(self, x, estep, attn_flag=True):
         global hp_draw, idx, cache, last_epoch
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -107,25 +111,42 @@ class Attention(nn.Module):
             )
         else:
             q = q * self.scale
-
             epoch, step = estep
 
-            attn = q @ k.transpose(-2, -1)
+            attn = q @ k.transpose(-2, -1)  # Shape: (B, H, N, N)
 
             if cache is None or last_epoch is None or last_epoch != epoch:
-                cache = get_mask_attn_wythoff(q=q, k=k, is_modified=False, depth_id=self.depth_id)
+                cache = get_mask_attn_wythoff(
+                    B=B, 
+                    H=self.num_heads, 
+                    N=N, 
+                    is_modified=False,
+                    is_shuffled=True, 
+                    depth_id=self.depth_id, 
+                    add_class_token=True, 
+                    device=x.device, 
+                    dtype=attn.dtype
+                )
                 last_epoch = epoch
 
-            attn = attn * (cache).float()
+            attn = attn * cache
+
+            if not Attention.mask_plotted:
+                plot_attention_mask_for_all_heads(cache, config.output_dir)
+                Attention.mask_plotted = True
 
             attn = attn.softmax(dim=-1)
-
             attn = self.attn_drop(attn)
+
+            if attn_flag and not self.training:
+                return attn
+
             x = attn @ v
+
+            save_intermediate_x(x)
 
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
-
         x = self.proj_drop(x)
         return x
 
@@ -183,8 +204,9 @@ class Block(nn.Module):
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x, mask_q, mask_k, mask_attn, estep):
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), mask_q, mask_k, mask_attn, estep)))
+    def forward(self, x, estep, attn_flag=False):
+        if attn_flag and not self.training: return self.attn(self.norm1(x), estep, attn_flag) # Return the attn for visualization
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), estep)))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
 
         return x
@@ -272,7 +294,8 @@ class ParallelScalingBlock(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
-        self.fused_attn = use_fused_attn()
+        # self.fused_attn = use_fused_attn()
+        self.fused_attn = False
         mlp_hidden_dim = int(mlp_ratio * dim)
         in_proj_out_dim = mlp_hidden_dim + 3 * dim
 
@@ -683,8 +706,8 @@ class VisionTransformer(nn.Module):
         x = self.head_drop(x)
         return x if pre_logits else self.head(x)
 
-    def forward(self, x, mask_q, mask_k, mask_attn, estep):
-        x = self.forward_features(x, mask_q, mask_k, mask_attn, estep)
+    def forward(self, x, estep):
+        x = self.forward_features(x, estep)
         x = self.forward_head(x)
         return x
 
@@ -1643,6 +1666,14 @@ def vit_base_patch16_224(pretrained=False, **kwargs) -> VisionTransformer:
     model = _create_vision_transformer('vit_base_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 
+@register_model
+def vit_base_patch4_32(pretrained=False, **kwargs) -> VisionTransformer:
+    """ ViT-Base (ViT-B/16) from original paper (https://arxiv.org/abs/2010.11929).
+    ImageNet-1k weights fine-tuned from in21k @ 224x224, source https://github.com/google-research/vision_transformer.
+    """
+    model_args = dict(patch_size=4, embed_dim=768, depth=12, num_heads=12)
+    model = _create_vision_transformer('vit_base_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
 
 @register_model
 def vit_base_patch16_384(pretrained=False, **kwargs) -> VisionTransformer:
