@@ -96,39 +96,44 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.mask_flags = True
 
-    def forward(self, x, estep, attn_flag=True):
-        global hp_draw, idx, cache, last_epoch
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
+    def forward(self, x, estep, attn_flag=False):
+        global cache, last_epoch
 
+        B, N, C = x.shape   # N includes the class token
+        qkv = self.qkv(x) \
+                  .reshape(B, N, 3, self.num_heads, self.head_dim) \
+                  .permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
-                q, k, v,
-                dropout_p=self.attn_drop.p,
+                q, k, v, dropout_p=self.attn_drop.p
             )
         else:
             q = q * self.scale
             epoch, step = estep
 
-            attn = q @ k.transpose(-2, -1)  # Shape: (B, H, N, N)
+            # compute raw attention scores
+            attn = q @ k.transpose(-2, -1)  # (B, H, N, N)
 
-            if cache is None or last_epoch is None or last_epoch != epoch:
-                cache = get_mask_attn_wythoff(
-                    B=B, 
-                    H=self.num_heads, 
-                    N=N, 
+            # only rebuild mask when epoch changes
+            if cache is None or last_epoch != epoch:
+                # pass N-1 tokens (exclude class) + add_class_token=True → mask shape (H, N, N)
+                m = get_mask_attn_wythoff(
+                    H=self.num_heads,
+                    N=N - 1,
                     is_modified=False,
-                    is_shuffled=True, 
-                    depth_id=self.depth_id, 
-                    add_class_token=True, 
-                    device=x.device, 
+                    is_shuffled=True,
+                    depth_id=self.depth_id,
+                    add_class_token=True,
+                    device=x.device,
                     dtype=attn.dtype
                 )
+                cache = m.unsqueeze(0)  # → (1, H, N, N)
                 last_epoch = epoch
 
+            # elementwise mask
             attn = attn * cache
 
             if not Attention.mask_plotted:
@@ -142,7 +147,6 @@ class Attention(nn.Module):
                 return attn
 
             x = attn @ v
-
             save_intermediate_x(x)
 
         x = x.transpose(1, 2).reshape(B, N, C)

@@ -12,14 +12,13 @@ import torch
 import math
 import random
 
-def get_mask_attn_wythoff(B, H, N, is_modified, is_shuffled, depth_id, 
-                                     add_class_token=True, device=torch.device('cpu'), 
-                                     dtype=torch.float32):
+def get_mask_attn_wythoff(H, N, is_modified, is_shuffled, depth_id,
+                          add_class_token=True, device=torch.device('cpu'),
+                          dtype=torch.float32):
     """
     Create a masked attention pattern based on Wythoff's sequence using only the tensor dimensions.
     
     Args:
-        B (int): Batch size.
         H (int): Number of attention heads.
         N (int): Number of tokens (excluding the special [CLS] token, if applicable).
         is_modified (bool): Whether to use the modified version of the sequence.
@@ -33,30 +32,28 @@ def get_mask_attn_wythoff(B, H, N, is_modified, is_shuffled, depth_id,
         torch.Tensor: The resulting attention mask of shape (B, H, N, N) or (B, H, N+1, N+1) if add_class_token is True.
     """
     headindices = generate_head_indices(N=N, h=H, wmin=5, is_modified=is_modified)
-    mask = torch.zeros((B, H, N, N), device=device, dtype=dtype)
-    
-    # Optionally shuffle head indices
+
     if is_shuffled:
         headindices = shuffle(depth_id, headindices)
-    
-    # Build the mask using Wythoff-based diagonal patterns
-    for h in range(H):
-        fib_indices = headindices[h]
-        for i in fib_indices:
-            # Create diagonal masks (positive offsets)
-            indices = torch.arange(max(-i, 0), min(N, N - i), device=device)
-            mask[:, h, indices, indices + i] = 1
-            # Create diagonal masks (negative offsets)
-            indices = torch.arange(max(i, 0), min(N, N + i), device=device)
-            mask[:, h, indices, indices - i] = 1
 
-    # Optionally extend the mask to include a class token in the first row and column
+    mask = torch.zeros((H, N, N), device=device, dtype=dtype)
+    for h in range(H):
+        for i in headindices[h]:
+            # positive diagonal
+            idx = torch.arange(max(-i, 0), min(N, N - i), device=device)
+            mask[h, idx, idx + i] = 1
+            # negative diagonal
+            idx = torch.arange(max(i, 0), min(N, N + i), device=device)
+            mask[h, idx, idx - i] = 1
+
     if add_class_token:
-        mask_extended = torch.ones((B, H, N + 1, N + 1), device=device, dtype=dtype)
-        mask_extended[:, :, 1:, 1:] = mask
-        return mask_extended
-    
+        # make a full‐ones row/col for the [CLS] token
+        ext = torch.ones((H, N + 1, N + 1), device=device, dtype=dtype)
+        ext[:, 1:, 1:] = mask
+        return ext
+
     return mask
+
 
 def generate_head_indices(N, h, wmin, is_modified):
     """
@@ -73,21 +70,21 @@ def generate_head_indices(N, h, wmin, is_modified):
     """
     wmax = N // 3
     headindices = [[] for _ in range(h)]
-    phi = (1 + math.sqrt(5)) / 2  # Golden ratio
+    phi = (1 + math.sqrt(5)) / 2
 
     for i in range(1, h + 1):
         a = int(math.floor(math.floor(i * phi) * phi))
         b = int(math.floor(math.floor(i * phi) * (phi ** 2)))
         w = wmin + int((wmax - wmin) / (h - 1) * (i - 1))
         if is_modified:
-            b_Wyt_m = b - a
-            a_Wyt_m = a - b_Wyt_m
-            headindices[i - 1] = get_fibonacci(a_Wyt_m, b_Wyt_m, w)
+            b_m = b - a
+            a_m = a - b_m
+            seq = get_fibonacci(a_m, b_m, w)
         else:
-            headindices[i - 1] = get_fibonacci(a, b, w)
-    
-    headindices = [torch.tensor(seq, dtype=torch.int64) for seq in headindices]
-    return headindices
+            seq = get_fibonacci(a, b, w)
+        headindices[i - 1] = seq
+
+    return [torch.tensor(seq, dtype=torch.int64) for seq in headindices]
 
 def get_fibonacci(a, b, w):
     """
@@ -101,10 +98,10 @@ def get_fibonacci(a, b, w):
     Returns:
         list: Fibonacci sequence (adjusted) not exceeding w.
     """
-    fib_seq = [a, b]
-    while fib_seq[-1] <= w:
-        fib_seq.append(fib_seq[-1] + fib_seq[-2])
-    return fib_seq[:-1]
+    fib = [a, b]
+    while fib[-1] <= w:
+        fib.append(fib[-1] + fib[-2])
+    return fib[:-1]
 
 def shuffle(seed, array_of_sets):
     """
@@ -118,6 +115,6 @@ def shuffle(seed, array_of_sets):
         list: Shuffled array of index sets.
     """
     random.seed(seed)
-    shuffled_array = array_of_sets[:]
-    random.shuffle(shuffled_array)
-    return shuffled_array
+    arr = list(array_of_sets)
+    random.shuffle(arr)
+    return arr
